@@ -1,0 +1,10 @@
+# build output and the downloaded NirSoft package (fetched by scripts\get-soundvolumeview.cmd)
+bin/
+obj/
+
+# editor / OS noise
+.vs/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
