@@ -22,7 +22,8 @@ each program gets the format you want for as long as it runs.
 Typical use: a game that ships its own binaural HRTF (Valorant, CS2, Overwatch 2's in-engine Atmos …)
 should not have a second spatializer layered on top — the two smear each other's cues. Watch the game,
 set *active format = Off*, and keep your Atmos/Sonic/DTS for everything else without ever touching
-Settings again.
+Settings again. See [docs/known-games.md](docs/known-games.md) for which games belong on the list — and
+which ones are built for Windows Spatial Sound and should be left alone.
 
 ## Features
 
