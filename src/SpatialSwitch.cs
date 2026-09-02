@@ -21,8 +21,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SpatialSwitch")]
 [assembly: AssemblyDescription("Switch Windows Spatial Sound automatically while selected programs run")]
 [assembly: AssemblyProduct("SpatialSwitch")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace SpatialSwitch
 {
@@ -44,18 +44,51 @@ namespace SpatialSwitch
         /// <summary>GUID→name pairs learned from successful switches, so the status line can show names for formats we've seen.</summary>
         public List<FormatGuid> LearnedFormats = new List<FormatGuid>();
 
-        public static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SpatialSwitch"); } }
+        static string dir;
+        /// <summary>Directory given on the command line (--settings &lt;dir&gt;), if any.</summary>
+        public static string DirOverride;
+        /// <summary>True when %APPDATA% could not be resolved and the folder next to the executable is used instead.</summary>
+        public static bool DirUnresolved;
+        /// <summary>True when Load() found and read settings.xml (false = built-in defaults are in use).</summary>
+        public static bool Loaded;
+
+        /// <summary>
+        /// Settings directory, resolved once per process. Right after sign-in (the Run key starts us early) the
+        /// roaming AppData folder can come back empty for a moment; an empty answer would silently make every path
+        /// relative, the settings file would "not exist" and the app would run with an empty watch list and no log.
+        /// So: shell folder, then the environment, then the folder next to the executable — never a relative path.
+        /// </summary>
+        public static string Dir
+        {
+            get
+            {
+                if (dir != null) return dir;
+                string d = DirOverride;
+                if (string.IsNullOrEmpty(d)) { try { d = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData, Environment.SpecialFolderOption.DoNotVerify); } catch { d = null; } }
+                if (string.IsNullOrEmpty(d)) d = Environment.GetEnvironmentVariable("APPDATA");
+                if (string.IsNullOrEmpty(d)) { var up = Environment.GetEnvironmentVariable("USERPROFILE"); if (!string.IsNullOrEmpty(up)) d = Path.Combine(up, "AppData", "Roaming"); }
+                if (string.IsNullOrEmpty(d) || !Path.IsPathRooted(d)) { d = AppDomain.CurrentDomain.BaseDirectory; DirUnresolved = true; }
+                if (string.IsNullOrEmpty(DirOverride)) d = Path.Combine(d, "SpatialSwitch");
+                dir = d;
+                return dir;
+            }
+        }
         public static string FilePath { get { return Path.Combine(Dir, "settings.xml"); } }
 
         public static Settings Load()
         {
+            Loaded = false;
             try
             {
                 if (File.Exists(FilePath))
                     using (var fs = File.OpenRead(FilePath))
-                        return (Settings)new XmlSerializer(typeof(Settings)).Deserialize(fs);
+                    {
+                        var loaded = (Settings)new XmlSerializer(typeof(Settings)).Deserialize(fs);
+                        Loaded = true;
+                        return loaded;
+                    }
             }
-            catch (Exception ex) { Log.Write("settings load failed: " + ex.Message); }
+            catch (Exception ex) { Program.Breadcrumb("settings load failed: " + ex.GetType().Name + ": " + ex.Message); Log.Write("settings load failed: " + ex.Message); }
             return new Settings();
         }
 
@@ -77,17 +110,24 @@ namespace SpatialSwitch
         public static string Path { get { return System.IO.Path.Combine(Settings.Dir, "spatialswitch.log"); } }
         public static void Write(string msg)
         {
-            try
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine;
+            lock (gate)
             {
-                lock (gate)
+                // settings folder first; if that is not writable (unresolved profile, permissions), the folder next to the
+                // executable — a log that silently goes nowhere is how a broken start stays invisible
+                foreach (var p in new[] { Path, System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "spatialswitch.log") })
                 {
-                    Directory.CreateDirectory(Settings.Dir);
-                    var fi = new FileInfo(Path);
-                    if (fi.Exists && fi.Length > 1024 * 1024) fi.Delete();
-                    File.AppendAllText(Path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine);
+                    try
+                    {
+                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(p));
+                        var fi = new FileInfo(p);
+                        if (fi.Exists && fi.Length > 1024 * 1024) fi.Delete();
+                        File.AppendAllText(p, line);
+                        return;
+                    }
+                    catch (Exception ex) { Program.Breadcrumb("log write to " + p + " failed: " + ex.GetType().Name + ": " + ex.Message); }
                 }
             }
-            catch { }
         }
     }
 
@@ -304,6 +344,9 @@ namespace SpatialSwitch
         public MainForm(bool startHidden)
         {
             s = Settings.Load();
+            Log.Write(Settings.Loaded
+                ? "settings loaded from " + Settings.FilePath + ": " + s.WatchedProcesses.Count + " watched program(s), device '" + s.DeviceId + "', active '" + Formats.Label(s.ActiveFormat) + "', restore '" + Formats.Label(s.RestoreFormat) + "'"
+                : "no settings file at " + Settings.FilePath + " -> defaults (nothing is watched until programs are added)");
             foreach (var fg in s.LearnedFormats) Formats.Learn(fg.Guid, fg.Name);
             Text = "SpatialSwitch"; Width = 560; Height = 540; FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -367,21 +410,16 @@ namespace SpatialSwitch
 
             Load += (o, e) =>
             {
-                PopulateDevices();
-                PopulateFormats();
-                if (!Svv.Available) { lblStatus.Text = "SoundVolumeView.exe is missing next to SpatialSwitch.exe — run scripts\\get-soundvolumeview.cmd. Switching disabled."; Log.Write(lblStatus.Text); }
-                else
+                // Started by the Run key right after sign-in? Give the audio service and the profile a moment before the
+                // first device query; otherwise the configured device may not be reported yet.
+                int sinceBoot = Environment.TickCount;
+                if (startHidden && sinceBoot >= 0 && sinceBoot < 180000)
                 {
-                    // first start: adopt whatever format is currently in use as the restore format
-                    if (string.IsNullOrEmpty(s.RestoreFormat) && !string.IsNullOrEmpty(s.DeviceId))
-                    {
-                        var cur = CurrentFormat();
-                        if (!string.IsNullOrEmpty(cur)) { s.RestoreFormat = cur; cboRestore.Text = Formats.Label(cur); s.Save(); Log.Write("adopted current format as restore format: " + cur); }
-                    }
-                    RefreshStatus(true); Poll();
+                    Log.Write("started " + (sinceBoot / 1000) + " s after boot - waiting 15 s before the first device query");
+                    Later(15000, InitAfterStartup);
                 }
+                else InitAfterStartup();
                 ApplyAutostart();
-                timer.Start();
                 if (startHidden) { Hide(); ShowInTaskbar = false; TrimMemory(); }
             };
             FormClosing += (o, e) =>
@@ -391,6 +429,53 @@ namespace SpatialSwitch
                 if (overrideActive && s.RestoreOnExit && Svv.Available) { Apply(s.RestoreFormat); Log.Write("exit: applied restore format " + Formats.Label(s.RestoreFormat)); }
                 tray.Visible = false;
             };
+        }
+
+        int startupRetries;
+
+        /// <summary>Runs an action once on the UI thread after a delay.</summary>
+        void Later(int ms, Action action)
+        {
+            var t = new System.Windows.Forms.Timer { Interval = ms };
+            t.Tick += (o, e) => { t.Stop(); t.Dispose(); action(); };
+            t.Start();
+        }
+
+        /// <summary>Device/format discovery, first-start adoption, self-heal, then regular polling.</summary>
+        void InitAfterStartup()
+        {
+            PopulateDevices();
+            PopulateFormats();
+            if (!Svv.Available)
+            {
+                lblStatus.Text = "SoundVolumeView.exe is missing next to SpatialSwitch.exe — run scripts\\get-soundvolumeview.cmd. Switching disabled.";
+                Log.Write(lblStatus.Text); timer.Start(); return;
+            }
+            // configured device not reported yet (audio service still coming up)? retry for up to a minute
+            if (!string.IsNullOrEmpty(s.DeviceId) && Svv.SpatialGuid(s.DeviceId) == null && startupRetries++ < 30)
+            {
+                Log.Write("device '" + s.DeviceId + "' not reported yet - retrying in 2 s"); Later(2000, InitAfterStartup); return;
+            }
+            // first start: adopt whatever format is currently in use as the restore format
+            if (string.IsNullOrEmpty(s.RestoreFormat) && !string.IsNullOrEmpty(s.DeviceId))
+            {
+                var cur = CurrentFormat();
+                if (!string.IsNullOrEmpty(cur)) { s.RestoreFormat = cur; cboRestore.Text = Formats.Label(cur); s.Save(); Log.Write("adopted current format as restore format: " + cur); }
+            }
+            RefreshStatus(true);
+            // self-heal: if we were not running when the last watched program exited (sign-out, crash, kill), the device
+            // may still be on the "active" format - put the restore format back before regular polling starts
+            if (s.WatchingEnabled && !string.IsNullOrEmpty(s.DeviceId) && !string.IsNullOrEmpty(s.RestoreFormat) && !AnyWatchedRunning())
+            {
+                var cur = CurrentFormat();
+                if (cur != null && !string.Equals(cur, s.RestoreFormat, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Write("start: no watched program runs but the device reports " + Formats.Label(cur) + " -> applying restore format " + Formats.Label(s.RestoreFormat));
+                    Apply(s.RestoreFormat); RefreshStatus(false);
+                }
+            }
+            Poll();
+            timer.Start();
         }
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool SetProcessWorkingSetSize(IntPtr h, IntPtr min, IntPtr max);
@@ -498,6 +583,12 @@ namespace SpatialSwitch
 
         void Poll()
         {
+            try { PollCore(); }
+            catch (Exception ex) { Log.Write("poll error: " + ex.Message); }
+        }
+
+        void PollCore()
+        {
             if (!s.WatchingEnabled || !Svv.Available || string.IsNullOrEmpty(s.DeviceId)) return;
             bool running = AnyWatchedRunning();
             if (running && !overrideActive)
@@ -529,14 +620,23 @@ namespace SpatialSwitch
         }
     }
 
-    static class Program
+    public static class Program
     {
         [STAThread]
+        /// <summary>Breadcrumb in %TEMP% written before anything else, so a start that never reaches the log is still visible.</summary>
+        public static void Breadcrumb(string what)
+        {
+            try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "spatialswitch-start.txt"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  pid " + Process.GetCurrentProcess().Id + "  " + what + Environment.NewLine); } catch { }
+        }
+
         static void Main(string[] args)
         {
+            for (int i = 0; i + 1 < args.Length; i++) if (args[i].Equals("--settings", StringComparison.OrdinalIgnoreCase)) Settings.DirOverride = args[i + 1];
+            Breadcrumb("main: args='" + string.Join(" ", args) + "' dir=" + Settings.Dir + " settingsFile=" + (File.Exists(Settings.FilePath) ? "found" : "MISSING") + " cwd=" + Environment.CurrentDirectory);
             bool created;
             using (var mx = new Mutex(true, "SpatialSwitch_SingleInstance", out created))
             {
+                Breadcrumb("single-instance mutex created=" + created);
                 if (!created)
                 {
                     // second launch (e.g. a shortcut) just asks the running instance to show its window
@@ -545,7 +645,8 @@ namespace SpatialSwitch
                 }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Log.Write("start " + string.Join(" ", args));
+                Log.Write("start v" + Assembly.GetExecutingAssembly().GetName().Version + " " + string.Join(" ", args));
+                Log.Write("settings dir: " + Settings.Dir + (Settings.DirUnresolved ? "  (WARNING: %APPDATA% could not be resolved - using the folder next to the executable)" : ""));
                 Application.Run(new MainForm(args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase))));
                 Log.Write("stop");
             }
