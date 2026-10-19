@@ -21,8 +21,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SpatialSwitch")]
 [assembly: AssemblyDescription("Switch Windows Spatial Sound automatically while selected programs run")]
 [assembly: AssemblyProduct("SpatialSwitch")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 namespace SpatialSwitch
 {
@@ -35,8 +35,12 @@ namespace SpatialSwitch
         public string DeviceId = "";
         /// <summary>Format applied while any watched program runs. Empty = spatial sound Off (plain stereo).</summary>
         public string ActiveFormat = "";
-        /// <summary>Format restored when no watched program runs. Empty at first start = "use whatever is set right now".</summary>
+        /// <summary>Format restored when no watched program runs. Empty = spatial sound Off (plain stereo).</summary>
         public string RestoreFormat = "";
+        /// <summary>True until a restore format has been adopted from the device or chosen in the window. Kept apart from
+        /// RestoreFormat because "" there means Off, a deliberate choice that must never be overwritten. Absent in older
+        /// settings files, which therefore count as chosen.</summary>
+        public bool RestoreFormatUnset;
         public bool WatchingEnabled = true;
         public bool StartWithWindows = true;
         public bool RestoreOnExit = true;
@@ -88,17 +92,26 @@ namespace SpatialSwitch
                         return loaded;
                     }
             }
-            catch (Exception ex) { Program.Breadcrumb("settings load failed: " + ex.GetType().Name + ": " + ex.Message); Log.Write("settings load failed: " + ex.Message); }
-            return new Settings();
+            catch (Exception ex)
+            {
+                Program.Breadcrumb("settings load failed: " + ex.GetType().Name + ": " + ex.Message); Log.Write("settings load failed: " + ex.Message);
+                // the next Save() would replace the unreadable file with defaults - keep a copy so the watch list can be recovered
+                try { File.Copy(FilePath, FilePath + ".bad", true); Log.Write("unreadable settings file kept as " + FilePath + ".bad"); } catch { }
+            }
+            return new Settings { RestoreFormatUnset = true };
         }
 
+        /// <summary>Writes a temp file and swaps it in, so a crash or power loss mid-write never leaves a truncated settings file.</summary>
         public void Save()
         {
             try
             {
                 Directory.CreateDirectory(Dir);
-                using (var fs = File.Create(FilePath))
+                string tmp = FilePath + ".tmp";
+                using (var fs = File.Create(tmp))
                     new XmlSerializer(typeof(Settings)).Serialize(fs, this);
+                if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null, true);
+                else File.Move(tmp, FilePath);
             }
             catch (Exception ex) { Log.Write("settings save failed: " + ex.Message); }
         }
@@ -120,14 +133,23 @@ namespace SpatialSwitch
                     try
                     {
                         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(p));
-                        var fi = new FileInfo(p);
-                        if (fi.Exists && fi.Length > 1024 * 1024) fi.Delete();
+                        Trim(p, 1024 * 1024);
                         File.AppendAllText(p, line);
                         return;
                     }
                     catch (Exception ex) { Program.Breadcrumb("log write to " + p + " failed: " + ex.GetType().Name + ": " + ex.Message); }
                 }
             }
+        }
+
+        /// <summary>Once a file exceeds maxBytes, keeps only its newer half (cut at a line break).</summary>
+        public static void Trim(string path, long maxBytes)
+        {
+            var fi = new FileInfo(path);
+            if (!fi.Exists || fi.Length <= maxBytes) return;
+            string text = File.ReadAllText(path);
+            int cut = text.IndexOf('\n', text.Length / 2);
+            File.WriteAllText(path, cut < 0 ? "" : text.Substring(cut + 1));
         }
     }
 
@@ -163,8 +185,14 @@ namespace SpatialSwitch
             if (string.IsNullOrEmpty(guid)) return Off;
             string n; return guidNames.TryGetValue(guid, out n) ? n : guid;
         }
+        /// <summary>True if both denote the same format; each side may be a name, a GUID or "" (Off). A name and a GUID
+        /// only match once that GUID's name is known (built in, or learned from an earlier switch).</summary>
+        public static bool Same(string a, string b) { return string.Equals(Normalize(a), Normalize(b), StringComparison.OrdinalIgnoreCase); }
+        static string Normalize(string f) { f = (f ?? "").Trim(); return f.StartsWith("{") ? FromGuid(f) : f; }
+        /// <summary>True if a GUID is known for this format name, i.e. a device reading can confirm or rule it out.</summary>
+        public static bool IsKnownName(string name) { return guidNames.Values.Any(v => string.Equals(v, name, StringComparison.OrdinalIgnoreCase)); }
         public static string Label(string format) { return string.IsNullOrEmpty(format) ? OffLabel : format; }
-        public static string FromLabel(string label) { return (label ?? "").Trim() == OffLabel ? Off : (label ?? "").Trim(); }
+        public static string FromLabel(string label) { var t = (label ?? "").Replace("\"", "").Trim(); return t == OffLabel ? Off : t; }
 
         /// <summary>
         /// Formats installed on this machine: Windows Sonic plus every PCM-input audio encoder that installed packages
@@ -230,22 +258,41 @@ namespace SpatialSwitch
     {
         public static string ExePath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SoundVolumeView.exe"); } }
         public static bool Available { get { return File.Exists(ExePath); } }
+        /// <summary>/SetSpatial was updated for Windows 11 25H2 in 2.48; older builds may silently do nothing there.</summary>
+        public static readonly Version MinVersion = new Version(2, 48);
+
+        /// <summary>File version of SoundVolumeView.exe, or null if it is missing or unreadable. Read from the version
+        /// string: NirSoft stores "2.53" as the numeric parts 2.5.3.0.</summary>
+        public static Version FileVersion()
+        {
+            try
+            {
+                Version v;
+                return Version.TryParse((FileVersionInfo.GetVersionInfo(ExePath).FileVersion ?? "").Trim(), out v) ? v : null;
+            }
+            catch { return null; }
+        }
 
         static int Run(string args)
         {
             var psi = new ProcessStartInfo(ExePath, args) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
-            using (var p = Process.Start(psi))
+            try
             {
-                if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } return -1; }
-                return p.ExitCode;
+                // can throw: exe deleted or blocked, or Windows refusing new processes while the session ends
+                using (var p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } return -1; }
+                    return p.ExitCode;
+                }
             }
+            catch (Exception ex) { Log.Write("SoundVolumeView " + args + " failed to run: " + ex.Message); return -1; }
         }
 
         /// <summary>Asks SoundVolumeView to set the format. Note: it returns 0 even for a format that is not installed
         /// (nothing changes then), so callers must read the device back — see MainForm.Apply.</summary>
         public static bool SetSpatial(string deviceId, string format)
         {
-            int rc = Run("/SetSpatial \"" + deviceId + "\" \"" + (format ?? "") + "\"");
+            int rc = Run("/SetSpatial \"" + deviceId + "\" \"" + (format ?? "").Replace("\"", "") + "\"");
             Log.Write("SetSpatial [" + deviceId + "] -> " + Formats.Label(format) + "  rc=" + rc);
             return rc == 0;
         }
@@ -253,10 +300,16 @@ namespace SpatialSwitch
         static List<Dictionary<string, string>> Export()
         {
             var rows = new List<Dictionary<string, string>>();
-            string tmp = Path.Combine(Path.GetTempPath(), "spatialswitch-devices.csv");
-            if (Run("/scomma \"" + tmp + "\"") != 0 || !File.Exists(tmp)) return rows;
+            string tmp = Path.Combine(Path.GetTempPath(), "spatialswitch-devices-" + Process.GetCurrentProcess().Id + ".csv");
+            // never read a previous export: a run that "succeeds" without writing would otherwise report stale device state
+            try { File.Delete(tmp); } catch { return rows; }
             string[] lines;
-            using (var sr = new StreamReader(tmp, Encoding.Default, true)) lines = sr.ReadToEnd().Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            try
+            {
+                if (Run("/scomma \"" + tmp + "\"") != 0 || !File.Exists(tmp)) return rows;
+                using (var sr = new StreamReader(tmp, Encoding.Default, true)) lines = sr.ReadToEnd().Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            finally { try { File.Delete(tmp); } catch { } }
             if (lines.Length < 2) return rows;
             var header = ParseCsvLine(lines[0]);
             for (int i = 1; i < lines.Length; i++)
@@ -346,7 +399,7 @@ namespace SpatialSwitch
             s = Settings.Load();
             Log.Write(Settings.Loaded
                 ? "settings loaded from " + Settings.FilePath + ": " + s.WatchedProcesses.Count + " watched program(s), device '" + s.DeviceId + "', active '" + Formats.Label(s.ActiveFormat) + "', restore '" + Formats.Label(s.RestoreFormat) + "'"
-                : "no settings file at " + Settings.FilePath + " -> defaults (nothing is watched until programs are added)");
+                : "no usable settings file at " + Settings.FilePath + " -> defaults (nothing is watched until programs are added)");
             foreach (var fg in s.LearnedFormats) Formats.Learn(fg.Guid, fg.Name);
             Text = "SpatialSwitch"; Width = 560; Height = 540; FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -412,10 +465,10 @@ namespace SpatialSwitch
             {
                 // Started by the Run key right after sign-in? Give the audio service and the profile a moment before the
                 // first device query; otherwise the configured device may not be reported yet.
-                int sinceBoot = Environment.TickCount;
-                if (startHidden && sinceBoot >= 0 && sinceBoot < 180000)
+                int sinceSignIn = SecondsSinceSignIn();
+                if (startHidden && sinceSignIn >= 0 && sinceSignIn < 180)
                 {
-                    Log.Write("started " + (sinceBoot / 1000) + " s after boot - waiting 15 s before the first device query");
+                    Log.Write("started " + sinceSignIn + " s after boot/sign-in - waiting 15 s before the first device query");
                     Later(15000, InitAfterStartup);
                 }
                 else InitAfterStartup();
@@ -424,9 +477,21 @@ namespace SpatialSwitch
             };
             FormClosing += (o, e) =>
             {
-                if (!reallyExit) { e.Cancel = true; Hide(); ShowInTaskbar = false; tray.ShowBalloonTip(1500, "SpatialSwitch", "Still watching in the tray. Use Exit in the tray menu to quit.", ToolTipIcon.Info); TrimMemory(); return; }
+                // only the window's own close button hides to the tray; sign-out, shutdown and Task Manager really close -
+                // cancelling those would make Windows list SpatialSwitch as "preventing shutdown"
+                if (!reallyExit && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); ShowInTaskbar = false; tray.ShowBalloonTip(1500, "SpatialSwitch", "Still watching in the tray. Use Exit in the tray menu to quit.", ToolTipIcon.Info); TrimMemory(); return; }
                 timer.Stop();
-                if (overrideActive && s.RestoreOnExit && Svv.Available) { Apply(s.RestoreFormat); Log.Write("exit: applied restore format " + Formats.Label(s.RestoreFormat)); }
+                if (overrideActive && s.RestoreOnExit && Svv.Available)
+                {
+                    if (e.CloseReason == CloseReason.WindowsShutDown)
+                    {
+                        // Windows waits only a few seconds per app at sign-out: switch once, skip the read-back verification
+                        Svv.SetSpatial(s.DeviceId, s.RestoreFormat); overrideActive = false;
+                        Log.Write("session end: sent restore format " + Formats.Label(s.RestoreFormat));
+                    }
+                    else { Apply(s.RestoreFormat); Log.Write("exit: applied restore format " + Formats.Label(s.RestoreFormat)); }
+                }
+                Log.Write("closing (" + e.CloseReason + ")");
                 tray.Visible = false;
             };
         }
@@ -451,26 +516,33 @@ namespace SpatialSwitch
                 lblStatus.Text = "SoundVolumeView.exe is missing next to SpatialSwitch.exe — run scripts\\get-soundvolumeview.cmd. Switching disabled.";
                 Log.Write(lblStatus.Text); timer.Start(); return;
             }
+            if (startupRetries == 0)
+            {
+                var v = Svv.FileVersion();
+                if (v != null && v < Svv.MinVersion) Log.Write("WARNING: SoundVolumeView " + v + " is older than " + Svv.MinVersion + " - /SetSpatial may silently do nothing on Windows 11 25H2; run scripts\\get-soundvolumeview.cmd");
+                else Log.Write("SoundVolumeView " + (v == null ? "(version unknown)" : v.ToString()));
+            }
             // configured device not reported yet (audio service still coming up)? retry for up to a minute
             if (!string.IsNullOrEmpty(s.DeviceId) && Svv.SpatialGuid(s.DeviceId) == null && startupRetries++ < 30)
             {
                 Log.Write("device '" + s.DeviceId + "' not reported yet - retrying in 2 s"); Later(2000, InitAfterStartup); return;
             }
-            // first start: adopt whatever format is currently in use as the restore format
-            if (string.IsNullOrEmpty(s.RestoreFormat) && !string.IsNullOrEmpty(s.DeviceId))
+            // first start: adopt whatever format is currently in use (Off included) as the restore format
+            if (s.RestoreFormatUnset && !string.IsNullOrEmpty(s.DeviceId))
             {
                 var cur = CurrentFormat();
-                if (!string.IsNullOrEmpty(cur)) { s.RestoreFormat = cur; cboRestore.Text = Formats.Label(cur); s.Save(); Log.Write("adopted current format as restore format: " + cur); }
+                if (cur != null) { s.RestoreFormat = cur; s.RestoreFormatUnset = false; cboRestore.Text = Formats.Label(cur); s.Save(); Log.Write("adopted current format as restore format: " + Formats.Label(cur)); }
             }
             RefreshStatus(true);
-            // self-heal: if we were not running when the last watched program exited (sign-out, crash, kill), the device
-            // may still be on the "active" format - put the restore format back before regular polling starts
-            if (s.WatchingEnabled && !string.IsNullOrEmpty(s.DeviceId) && !string.IsNullOrEmpty(s.RestoreFormat) && !AnyWatchedRunning())
+            // self-heal: if we were not running when the last watched program exited (crash, kill, power loss), the device
+            // is still on the "active" format - put the restore format back before regular polling starts. Only from the
+            // active format: any other format was chosen by hand while we were not running and is left alone.
+            if (s.WatchingEnabled && !string.IsNullOrEmpty(s.DeviceId) && !s.RestoreFormatUnset && !Formats.Same(s.ActiveFormat, s.RestoreFormat) && !AnyWatchedRunning())
             {
                 var cur = CurrentFormat();
-                if (cur != null && !string.Equals(cur, s.RestoreFormat, StringComparison.OrdinalIgnoreCase))
+                if (cur != null && Formats.Same(cur, s.ActiveFormat))
                 {
-                    Log.Write("start: no watched program runs but the device reports " + Formats.Label(cur) + " -> applying restore format " + Formats.Label(s.RestoreFormat));
+                    Log.Write("start: no watched program runs but the device is still on the active format " + Formats.Label(cur) + " -> applying restore format " + Formats.Label(s.RestoreFormat));
                     Apply(s.RestoreFormat); RefreshStatus(false);
                 }
             }
@@ -481,6 +553,29 @@ namespace SpatialSwitch
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool SetProcessWorkingSetSize(IntPtr h, IntPtr min, IntPtr max);
         /// <summary>Release startup/JIT pages while hidden so the tray footprint stays small.</summary>
         static void TrimMemory() { try { GC.Collect(); GC.WaitForPendingFinalizers(); SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, (IntPtr)(-1), (IntPtr)(-1)); } catch { } }
+
+        /// <summary>Seconds since the later of boot and this session's sign-in. Uptime alone is not enough: with Fast Startup
+        /// (the default) "Shut down" resumes the kernel, so uptime counts from the last full restart, and a sign-out/sign-in
+        /// keeps it running too. The session's oldest Explorer stands in for the sign-in time. -1 if neither is known.</summary>
+        static int SecondsSinceSignIn()
+        {
+            int uptime = Environment.TickCount >= 0 ? Environment.TickCount / 1000 : -1;
+            int shell = -1;
+            try
+            {
+                int session = Process.GetCurrentProcess().SessionId;
+                foreach (var p in Process.GetProcessesByName("explorer"))
+                {
+                    try { if (p.SessionId == session) shell = Math.Max(shell, (int)(DateTime.Now - p.StartTime).TotalSeconds); }
+                    catch { }
+                    finally { p.Dispose(); }
+                }
+            }
+            catch { }
+            if (uptime < 0) return shell;
+            if (shell < 0) return uptime;
+            return Math.Min(uptime, shell);
+        }
 
         void ShowWindow() { Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; Activate(); PopulateFormats(); RefreshStatus(true); }
 
@@ -500,10 +595,15 @@ namespace SpatialSwitch
             string before = Svv.SpatialGuid(s.DeviceId);
             bool sent = Svv.SetSpatial(s.DeviceId, format);
             string after = Svv.SpatialGuid(s.DeviceId);
-            bool ok;
-            if (string.IsNullOrEmpty(format)) ok = sent && after == "";
-            else ok = sent && !string.IsNullOrEmpty(after) && (after != before || string.Equals(Formats.FromGuid(after), format, StringComparison.OrdinalIgnoreCase));
-            if (ok && !string.IsNullOrEmpty(format) && !format.StartsWith("{") && !string.IsNullOrEmpty(after))
+            bool ok, changed = after != null && after != before;
+            if (!sent || after == null) ok = false;
+            else if (string.IsNullOrEmpty(format)) ok = after == "";
+            else if (after == "") ok = false;
+            else if (Formats.Same(after, format) || changed) ok = true;
+            // unchanged and the device's GUID has no name yet: if the requested name has no known GUID either, the device was
+            // most likely already on it - nothing proves a failure, so don't warn (but don't learn the pair from a guess)
+            else ok = !format.StartsWith("{") && !Formats.IsKnownName(format) && Formats.FromGuid(after).StartsWith("{");
+            if (ok && changed && !string.IsNullOrEmpty(format) && !format.StartsWith("{"))
             {
                 Formats.Learn(after, format);
                 if (!s.LearnedFormats.Any(x => string.Equals(x.Guid, after, StringComparison.OrdinalIgnoreCase))) { s.LearnedFormats.Add(new FormatGuid { Guid = after, Name = format }); s.Save(); }
@@ -547,17 +647,27 @@ namespace SpatialSwitch
                 foreach (var f in installed) cbo.Items.Add(f);
                 cbo.Text = keep;
             }
-            Log.Write("installed spatial formats: " + string.Join(", ", installed));
+            string list = string.Join(", ", installed);
+            if (list != lastFormatList) { Log.Write("installed spatial formats: " + list); lastFormatList = list; }
         }
+        string lastFormatList;
 
         void SaveFromUi()
         {
+            string oldDevice = s.DeviceId;
             var d = cboDevice.SelectedItem as AudioDevice; if (d != null) s.DeviceId = d.Id;
             s.ActiveFormat = Formats.FromLabel(cboActive.Text);
-            s.RestoreFormat = Formats.FromLabel(cboRestore.Text);
+            s.RestoreFormat = Formats.FromLabel(cboRestore.Text); s.RestoreFormatUnset = false;
             s.WatchingEnabled = chkEnabled.Checked; miEnabled.Checked = s.WatchingEnabled;
             s.StartWithWindows = chkAutostart.Checked; s.RestoreOnExit = chkRestoreExit.Checked;
             s.Save(); ApplyAutostart();
+            // device changed while a watched program runs: hand the override over instead of stranding the old device on it
+            if (overrideActive && Svv.Available && !string.IsNullOrEmpty(oldDevice) && !string.Equals(oldDevice, s.DeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Write("device changed during override -> restoring '" + oldDevice + "', applying active format to '" + s.DeviceId + "'");
+                Svv.SetSpatial(oldDevice, s.RestoreFormat);
+                Apply(s.ActiveFormat);
+            }
         }
 
         void ApplyAutostart()
@@ -566,7 +676,14 @@ namespace SpatialSwitch
             {
                 using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
                 {
-                    if (s.StartWithWindows) k.SetValue("SpatialSwitch", "\"" + Application.ExecutablePath + "\" --tray");
+                    string cmd = "\"" + Application.ExecutablePath + "\" --tray";
+                    if (!string.IsNullOrEmpty(Settings.DirOverride))
+                    {
+                        // a trailing backslash would escape the closing quote ("C:\x\" -> C:\x")
+                        string dirArg = Settings.DirOverride.EndsWith("\\") ? Settings.DirOverride + "." : Settings.DirOverride;
+                        cmd += " --settings \"" + dirArg + "\"";
+                    }
+                    if (s.StartWithWindows) k.SetValue("SpatialSwitch", cmd);
                     else k.DeleteValue("SpatialSwitch", false);
                 }
             }
@@ -622,16 +739,21 @@ namespace SpatialSwitch
 
     public static class Program
     {
-        [STAThread]
         /// <summary>Breadcrumb in %TEMP% written before anything else, so a start that never reaches the log is still visible.</summary>
         public static void Breadcrumb(string what)
         {
-            try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "spatialswitch-start.txt"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  pid " + Process.GetCurrentProcess().Id + "  " + what + Environment.NewLine); } catch { }
+            try { string p = Path.Combine(Path.GetTempPath(), "spatialswitch-start.txt"); Log.Trim(p, 64 * 1024); File.AppendAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  pid " + Process.GetCurrentProcess().Id + "  " + what + Environment.NewLine); } catch { }
         }
 
+        [STAThread]   // keep directly on Main: WinForms dialogs and COM need the UI thread to be STA
         static void Main(string[] args)
         {
-            for (int i = 0; i + 1 < args.Length; i++) if (args[i].Equals("--settings", StringComparison.OrdinalIgnoreCase)) Settings.DirOverride = args[i + 1];
+            for (int i = 0; i + 1 < args.Length; i++)
+                if (args[i].Equals("--settings", StringComparison.OrdinalIgnoreCase))
+                {
+                    // absolute, so the autostart entry and a later working directory resolve to the same folder
+                    try { Settings.DirOverride = Path.GetFullPath(args[i + 1]); } catch { Settings.DirOverride = args[i + 1]; }
+                }
             Breadcrumb("main: args='" + string.Join(" ", args) + "' dir=" + Settings.Dir + " settingsFile=" + (File.Exists(Settings.FilePath) ? "found" : "MISSING") + " cwd=" + Environment.CurrentDirectory);
             bool created;
             using (var mx = new Mutex(true, "SpatialSwitch_SingleInstance", out created))
@@ -646,7 +768,7 @@ namespace SpatialSwitch
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Log.Write("start v" + Assembly.GetExecutingAssembly().GetName().Version + " " + string.Join(" ", args));
-                Log.Write("settings dir: " + Settings.Dir + (Settings.DirUnresolved ? "  (WARNING: %APPDATA% could not be resolved - using the folder next to the executable)" : ""));
+                Log.Write("settings dir: " + Settings.Dir + (Settings.DirUnresolved ? "  (WARNING: settings folder could not be resolved - using the folder next to the executable)" : ""));
                 Application.Run(new MainForm(args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase))));
                 Log.Write("stop");
             }

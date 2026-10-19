@@ -35,25 +35,29 @@ which ones are built for Windows Spatial Sound and should be left alone.
 - Every switch is **verified by reading the device back** — SoundVolumeView reports success even for a
   format that isn't installed, so SpatialSwitch checks the result and logs a warning instead of pretending it worked
 - First start adopts whatever format your device currently uses as the restore format
-- Edge-triggered: only acts on transitions, so manual changes mid-session are respected
-- Self-healing start: if it was not running when the last watched program exited (sign-out, crash, kill) and the
-  device is still on the "active" format, the restore format is put back at the next start
-- Sign-in friendly: when started less than three minutes after boot it waits 15 s and retries until the configured
-  device is reported, so the autostart never adopts a wrong device or format while the audio service is still coming up
+- Edge-triggered: only acts on transitions, so manual changes are respected
+- Sign-out / shutdown aware: never blocks Windows from ending the session, and puts the restore format back on the way out
+- Self-healing start: if it was not running when the last watched program exited (crash, kill, power loss) and the
+  device is still on the "active" format, the restore format is put back at the next start (any other format you
+  picked by hand in the meantime is left alone)
+- Sign-in friendly: when started less than three minutes after boot or sign-in (Fast Startup included) it waits 15 s
+  and retries until the configured device is reported, so the autostart never adopts a wrong device or format while
+  the audio service is still coming up
+- Crash-safe settings: written atomically; an unreadable file is kept as `settings.xml.bad` instead of being overwritten
 - Loud about its state: the log says which settings file was loaded and how many programs are watched; a one-line
   start breadcrumb goes to `%TEMP%\spatialswitch-start.txt` even if the log itself cannot be written
 - Tray icon with quick actions; window hides to the tray; single instance
 - "Start with Windows" (hidden), optional restore-on-exit, log file
-- Lightweight: single 25 KB executable on .NET Framework 4.8 (built into Windows), ~8 MB RAM hidden,
+- Lightweight: single ~150 KB executable (mostly the icon) on .NET Framework 4.8 (built into Windows), ~8 MB RAM hidden,
   one process-list scan per second (≈0.2 % of one core), no services, no admin rights
 
 ## Requirements
 
 - Windows 10/11 with .NET Framework 4.8 (present on every current Windows)
 - [SoundVolumeView](https://www.nirsoft.net/utils/sound_volume_view.html) by NirSoft, version 2.48 or
-  newer (its `/SetSpatial` command was updated for Windows 11 25H2 in 2.48). It is freeware and is **not**
-  included in this repository — run `scripts\get-soundvolumeview.cmd` to download it into `bin\`
-  (see `third_party/NOTICE.md`).
+  newer (its `/SetSpatial` command was updated for Windows 11 25H2 in 2.48; the download script and the log warn
+  about older builds). It is freeware and is **not** included in this repository — run
+  `scripts\get-soundvolumeview.cmd` to download it into `bin\` (see `third_party/NOTICE.md`).
 - Whatever spatial format you want to switch *to* must already be installed/licensed on the device
   (Dolby Atmos for Headphones requires the Dolby Access app; Windows Sonic is built in).
 
@@ -75,11 +79,12 @@ change it.
 
 Everything is set in the window: watched programs, output device, active format, restore format,
 autostart. Settings are stored in `%APPDATA%\SpatialSwitch\settings.xml`, the log in
-`%APPDATA%\SpatialSwitch\spatialswitch.log` (auto-trimmed at 1 MB).
+`%APPDATA%\SpatialSwitch\spatialswitch.log` (trimmed to its newer half at 1 MB).
 
 Command line: `SpatialSwitch.exe --tray` starts hidden (this is what the autostart entry uses);
 `--settings <dir>` uses a different settings/log folder (portable use, or when `%APPDATA%` is virtualised, e.g. inside
-an MSIX-packaged host — the sandboxed copy of AppData is not the one a normally started instance sees).
+an MSIX-packaged host — the sandboxed copy of AppData is not the one a normally started instance sees). The folder
+is made absolute and carried into the "Start with Windows" entry, so the autostarted instance uses it too.
 Launching the exe while it is already running just opens the existing instance's window.
 
 ## How the switch works
